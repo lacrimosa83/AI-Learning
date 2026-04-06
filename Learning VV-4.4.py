@@ -1,16 +1,15 @@
 """
 ============================================
 Curiosity-Driven Exploration Framework
-VERSION 4.3 - 中等难度（建立信心版）
+VERSION 4.4 - 高难度验证（从V4.3冠军模型迁移）
 ============================================
-基于 V4.2 的成功经验，适度降低难度：
-- 静态障碍物: 12 → 8 个
-- 动态障碍物: 4 → 2 个
-- 奖励半径: 0.4 → 0.5
-- 碰撞惩罚: 1.0 → 0.6
-- 环境噪声: 0.08 → 0.06
+核心策略：
+1. 从 V4.3 冠军模型开始（165.4 分）
+2. 切换到 V4.2 高难度环境（12静态+4动态障碍物）
+3. 继续训练 2000 episodes
+4. 验证信心是否可迁移到高难度
 
-预期目标：150-180 分
+预期目标：140-160 分（原始 V4.2 最佳 121 分）
 ============================================
 """
 
@@ -68,11 +67,11 @@ if torch.cuda.is_available():
 
 
 # ============================================
-# 动态障碍物类
+# V4.2 高难度环境（复现）
 # ============================================
 
 class DynamicObstacle:
-    def __init__(self, x, y, radius, speed=0.25):
+    def __init__(self, x, y, radius, speed=0.3):
         self.initial_x = x
         self.initial_y = y
         self.x = x
@@ -108,38 +107,34 @@ class DynamicObstacle:
         self.vy = random.uniform(-self.speed, self.speed)
 
 
-# ============================================
-# V4.3 环境模拟器（中等难度）
-# ============================================
-
-class World2DMedium:
+class World2DHighDifficulty:
     """
-    V4.3 中等难度环境
-    比 V4.1 难一点，比 V4.2 容易很多
+    V4.2 高难度环境（复现）
+    12 个静态障碍物 + 4 个动态障碍物
     """
 
     def __init__(self, world_size=12.0, friction=0.98,
                  reward_zones=None, static_obstacles=None,
                  dynamic_obstacles=None,
-                 noise_std=0.06, max_steps=200,
-                 collision_penalty=0.6):
+                 noise_std=0.08, max_steps=200,
+                 collision_penalty=1.0):
         self.world_size = world_size
         self.friction = friction
         self.max_steps = max_steps
         self.collision_penalty = collision_penalty
 
-        # 奖励区域：4个，半径 0.5（比 V4.2 的 0.4 大）
+        # 奖励区域：4个，半径 0.4
         if reward_zones is None:
             self.reward_zones = [
-                {'x': 4.0, 'y': 4.0, 'radius': 0.5, 'reward': 1.0},
-                {'x': -3.0, 'y': 3.0, 'radius': 0.5, 'reward': 1.0},
-                {'x': 2.0, 'y': -3.0, 'radius': 0.5, 'reward': 1.0},
-                {'x': -4.0, 'y': -2.0, 'radius': 0.5, 'reward': 1.0},
+                {'x': 4.0, 'y': 4.0, 'radius': 0.4, 'reward': 1.0},
+                {'x': -3.0, 'y': 3.0, 'radius': 0.4, 'reward': 1.0},
+                {'x': 2.0, 'y': -3.0, 'radius': 0.4, 'reward': 1.0},
+                {'x': -4.0, 'y': -2.0, 'radius': 0.4, 'reward': 1.0},
             ]
         else:
             self.reward_zones = reward_zones
 
-        # 静态障碍物：8个（比 V4.2 的 12 个少）
+        # 静态障碍物：12个
         if static_obstacles is None:
             self.static_obstacles = [
                 {'x': 0, 'y': 0, 'radius': 0.8},
@@ -150,15 +145,21 @@ class World2DMedium:
                 {'x': 3.5, 'y': -0.5, 'radius': 0.4},
                 {'x': -3.0, 'y': -0.5, 'radius': 0.4},
                 {'x': 0, 'y': 3.0, 'radius': 0.5},
+                {'x': 0, 'y': -3.0, 'radius': 0.5},
+                {'x': 3.0, 'y': -3.0, 'radius': 0.4},
+                {'x': -3.5, 'y': 1.0, 'radius': 0.4},
+                {'x': 1.5, 'y': 3.5, 'radius': 0.4},
             ]
         else:
             self.static_obstacles = static_obstacles
 
-        # 动态障碍物：2个（比 V4.2 的 4 个少）
+        # 动态障碍物：4个
         if dynamic_obstacles is None:
             self.dynamic_obstacles = [
-                DynamicObstacle(2.0, 1.0, 0.4, 0.25),
+                DynamicObstacle(2.0, 1.0, 0.4, 0.3),
                 DynamicObstacle(-1.0, -2.0, 0.4, 0.25),
+                DynamicObstacle(0, 2.5, 0.35, 0.35),
+                DynamicObstacle(-2.5, -1.0, 0.35, 0.3),
             ]
         else:
             self.dynamic_obstacles = dynamic_obstacles
@@ -167,18 +168,16 @@ class World2DMedium:
         self.reset()
 
     def reset(self, extreme=True):
-        # 从角落或边缘开始
         corners = [
-            (-self.world_size / 2 + 0.8, -self.world_size / 2 + 0.8),
-            (-self.world_size / 2 + 0.8, self.world_size / 2 - 0.8),
-            (self.world_size / 2 - 0.8, -self.world_size / 2 + 0.8),
-            (self.world_size / 2 - 0.8, self.world_size / 2 - 0.8),
+            (-self.world_size / 2 + 0.5, -self.world_size / 2 + 0.5),
+            (-self.world_size / 2 + 0.5, self.world_size / 2 - 0.5),
+            (self.world_size / 2 - 0.5, -self.world_size / 2 + 0.5),
+            (self.world_size / 2 - 0.5, self.world_size / 2 - 0.5),
         ]
         self.x, self.y = random.choice(corners)
-        self.vx = random.uniform(-1.5, 1.5)
-        self.vy = random.uniform(-1.5, 1.5)
+        self.vx = random.uniform(-2.0, 2.0)
+        self.vy = random.uniform(-2.0, 2.0)
 
-        # 确保起始位置不在障碍物内
         while self._check_collision(self.x, self.y, check_dynamic=False):
             self.x = np.random.uniform(-self.world_size / 2, self.world_size / 2)
             self.y = np.random.uniform(-self.world_size / 2, self.world_size / 2)
@@ -212,8 +211,8 @@ class World2DMedium:
         return False
 
     def _apply_collision_response(self):
-        self.vx = -self.vx * 0.5
-        self.vy = -self.vy * 0.5
+        self.vx = -self.vx * 0.4
+        self.vy = -self.vy * 0.4
 
         for obs in self.static_obstacles:
             dx = self.x - obs['x']
@@ -247,8 +246,8 @@ class World2DMedium:
         force_x = np.clip(action[0], -1.0, 1.0)
         force_y = np.clip(action[1], -1.0, 1.0)
 
-        self.vx += force_x * 0.15
-        self.vy += force_y * 0.15
+        self.vx += force_x * 0.12
+        self.vy += force_y * 0.12
 
         self.x += self.vx * 0.1
         self.y += self.vy * 0.1
@@ -258,17 +257,17 @@ class World2DMedium:
         half_size = self.world_size / 2
         if self.x > half_size:
             self.x = half_size - (self.x - half_size)
-            self.vx = -self.vx * 0.7
+            self.vx = -self.vx * 0.6
         elif self.x < -half_size:
             self.x = -half_size - (self.x + half_size)
-            self.vx = -self.vx * 0.7
+            self.vx = -self.vx * 0.6
 
         if self.y > half_size:
             self.y = half_size - (self.y - half_size)
-            self.vy = -self.vy * 0.7
+            self.vy = -self.vy * 0.6
         elif self.y < -half_size:
             self.y = -half_size - (self.y + half_size)
-            self.vy = -self.vy * 0.7
+            self.vy = -self.vy * 0.6
 
         for obs in self.dynamic_obstacles:
             obs.update(self.world_size)
@@ -307,7 +306,7 @@ class World2DMedium:
 
 
 # ============================================
-# 好奇心机制模块（与 V4.2 相同）
+# 好奇心机制模块（与 V4.2/V4.3 相同）
 # ============================================
 
 class PredictionErrorCuriosity(nn.Module):
@@ -493,31 +492,31 @@ class ContributionTracker:
 
 
 # ============================================
-# 自适应好奇心系统（V4.3）
+# 自适应好奇心系统（V4.4）
 # ============================================
 
 @dataclass
-class CuriosityConfigV43:
+class CuriosityConfigV44:
     state_dim: int = 4
     action_dim: int = 2
     num_mechanisms: int = 3
     hidden_dim: int = 256
     rnd_embedding_dim: int = 128
-    learning_rate: float = 0.003
+    learning_rate: float = 0.002  # 降低学习率，微调
     weight_update_freq: int = 10
     credit_gamma: float = 0.95
     save_freq: int = 100
-    checkpoint_dir: str = "checkpoints_v43"
+    checkpoint_dir: str = "checkpoints_v44"
     min_weight: float = 0.10
     novelty_reset_freq: int = 500
-    exploration_bonus: float = 0.08
+    exploration_bonus: float = 0.05  # 降低探索保底
     weight_reset_threshold: float = 0.95
-    high_score_threshold: float = 140
+    high_score_threshold: float = 130  # 高难度下降低阈值
     lock_duration: int = 80
 
 
-class AdaptiveCuriositySystemV43:
-    def __init__(self, config: CuriosityConfigV43):
+class AdaptiveCuriositySystemV44:
+    def __init__(self, config: CuriosityConfigV44):
         self.config = config
         self.num = config.num_mechanisms
 
@@ -550,7 +549,7 @@ class AdaptiveCuriositySystemV43:
         self.best_episode = 0
         self.high_score_lock_counter = 0
 
-        self.champion_path = os.path.join(config.checkpoint_dir, "champion_model_v43.pth")
+        self.champion_path = os.path.join(config.checkpoint_dir, "champion_model_v44.pth")
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     @property
@@ -642,29 +641,15 @@ class AdaptiveCuriositySystemV43:
     def is_high_score_lock_active(self):
         return self.high_score_lock_counter > 0
 
-    def _save_champion(self):
-        champion_checkpoint = {
-            'episode': self.episode_count,
-            'return': self.best_return,
-            'weights_logits': self.weights_logits.detach().cpu(),
-            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
-            'novelty_memory': list(self.mechanisms['novelty'].memory),
-            'novelty_count': self.mechanisms['novelty'].exploration_count,
-            'rnd_predictor_state': self.mechanisms['rnd'].predictor.state_dict(),
-            'rnd_mean': self.mechanisms['rnd'].mean.cpu(),
-            'rnd_std': self.mechanisms['rnd'].std.cpu(),
-            'rnd_count': self.mechanisms['rnd'].count.cpu(),
-            'timestamp': datetime.now().isoformat()
-        }
-        torch.save(champion_checkpoint, self.champion_path)
-
     def _update_weights(self):
+        """更新权重 - 基于近期信用"""
         if len(self.history['episode_returns']) < 5:
             return
         recent_credits = np.mean(self.history['mechanism_credits'][-5:], axis=0)
         self._update_weights_from_credit(recent_credits)
 
     def _update_weights_from_credit(self, credit):
+        """根据信用更新权重"""
         credit_sum = credit.sum()
         if credit_sum > 0:
             target = credit / credit_sum
@@ -682,29 +667,21 @@ class AdaptiveCuriositySystemV43:
         loss.backward()
         self.weights_optimizer.step()
 
-    def save_checkpoint(self):
-        checkpoint = {
+    def _save_champion(self):
+        champion_checkpoint = {
             'episode': self.episode_count,
-            'step': self.step_count,
+            'return': self.best_return,
             'weights_logits': self.weights_logits.detach().cpu(),
-            'weights_optimizer': self.weights_optimizer.state_dict(),
-            'history': self.history,
-            'best_return': self.best_return,
-            'best_episode': self.best_episode,
-            'high_score_lock_counter': self.high_score_lock_counter,
+            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
             'novelty_memory': list(self.mechanisms['novelty'].memory),
             'novelty_count': self.mechanisms['novelty'].exploration_count,
-            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
-            'pred_error_optimizer': self.mechanisms['prediction_error'].optimizer.state_dict(),
             'rnd_predictor_state': self.mechanisms['rnd'].predictor.state_dict(),
-            'rnd_optimizer': self.mechanisms['rnd'].optimizer.state_dict(),
             'rnd_mean': self.mechanisms['rnd'].mean.cpu(),
             'rnd_std': self.mechanisms['rnd'].std.cpu(),
             'rnd_count': self.mechanisms['rnd'].count.cpu(),
+            'timestamp': datetime.now().isoformat()
         }
-        path = f"{self.config.checkpoint_dir}/checkpoint_ep{self.episode_count}.pth"
-        torch.save(checkpoint, path)
-        print(f"   💾 检查点已保存: {path}")
+        torch.save(champion_checkpoint, self.champion_path)
 
     def load_checkpoint(self, path):
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
@@ -736,6 +713,51 @@ class AdaptiveCuriositySystemV43:
         print(f"✅ 从检查点恢复: Episode {self.episode_count}")
         print(f"🏆 历史最佳: Episode {self.best_episode}, Return {self.best_return:.2f}")
         return self.episode_count
+
+    def load_v43_champion(self):
+        """专门加载 V4.3 冠军模型"""
+        v43_champion_path = "checkpoints_v43/champion_model_v43.pth"
+        if os.path.exists(v43_champion_path):
+            checkpoint = torch.load(v43_champion_path, map_location='cpu', weights_only=False)
+            self.weights_logits.data = checkpoint['weights_logits'].to(DEVICE)
+            self.mechanisms['prediction_error'].load_state_dict(checkpoint['pred_error_state'])
+            self.mechanisms['novelty'].memory = deque(checkpoint['novelty_memory'], maxlen=15000)
+            self.mechanisms['novelty'].exploration_count = checkpoint['novelty_count']
+            self.mechanisms['rnd'].predictor.load_state_dict(checkpoint['rnd_predictor_state'])
+            self.mechanisms['rnd'].mean = checkpoint['rnd_mean'].to(DEVICE)
+            self.mechanisms['rnd'].std = checkpoint['rnd_std'].to(DEVICE)
+            self.mechanisms['rnd'].count = checkpoint['rnd_count'].to(DEVICE)
+            self.best_return = checkpoint.get('return', 0)
+            self.best_episode = checkpoint.get('episode', 0)
+            print(f"🏆 V4.3 冠军模型已加载 (Episode {self.best_episode}, Return {self.best_return:.2f})")
+            return True
+        else:
+            print("⚠️ 未找到 V4.3 冠军模型")
+            return False
+
+    def save_checkpoint(self):
+        checkpoint = {
+            'episode': self.episode_count,
+            'step': self.step_count,
+            'weights_logits': self.weights_logits.detach().cpu(),
+            'weights_optimizer': self.weights_optimizer.state_dict(),
+            'history': self.history,
+            'best_return': self.best_return,
+            'best_episode': self.best_episode,
+            'high_score_lock_counter': self.high_score_lock_counter,
+            'novelty_memory': list(self.mechanisms['novelty'].memory),
+            'novelty_count': self.mechanisms['novelty'].exploration_count,
+            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
+            'pred_error_optimizer': self.mechanisms['prediction_error'].optimizer.state_dict(),
+            'rnd_predictor_state': self.mechanisms['rnd'].predictor.state_dict(),
+            'rnd_optimizer': self.mechanisms['rnd'].optimizer.state_dict(),
+            'rnd_mean': self.mechanisms['rnd'].mean.cpu(),
+            'rnd_std': self.mechanisms['rnd'].std.cpu(),
+            'rnd_count': self.mechanisms['rnd'].count.cpu(),
+        }
+        path = f"{self.config.checkpoint_dir}/checkpoint_ep{self.episode_count}.pth"
+        torch.save(checkpoint, path)
+        print(f"   💾 检查点已保存: {path}")
 
     def get_stats(self):
         recent_returns = self.history['episode_returns'][-20:] if self.history['episode_returns'] else []
@@ -773,7 +795,7 @@ class Visualizer2D:
             'credit': self.fig.add_subplot(gs[1, 2])
         }
 
-        self.fig.suptitle('2D Exploration - V4.3 (中等难度，建立信心)', fontsize=14, fontweight='bold')
+        self.fig.suptitle('2D Exploration - V4.4 (高难度验证，从V4.3迁移)', fontsize=14, fontweight='bold')
         self.initialized = True
         plt.ion()
         plt.show()
@@ -804,7 +826,7 @@ class Visualizer2D:
         ax.set_ylim(-7, 7)
         ax.set_xlabel('X Position')
         ax.set_ylabel('Y Position')
-        ax.set_title('2D Trajectory with Obstacles')
+        ax.set_title('2D Trajectory with High Difficulty Obstacles')
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper right', fontsize=8)
         ax.set_aspect('equal')
@@ -885,41 +907,46 @@ class Visualizer2D:
 
 
 # ============================================
-# 训练函数（V4.3）
+# 训练函数（V4.4 - 从V4.3冠军模型迁移）
 # ============================================
 
-def train_v43(num_episodes: int = 3000,
+def train_v44(num_episodes: int = 2000,
               render: bool = True,
               save_freq: int = 100,
               verbose_freq: int = 20):
-    """V4.3 训练函数 - 中等难度，建立信心"""
+    """V4.4 训练 - 从 V4.3 冠军模型迁移到高难度"""
     print("=" * 60)
-    print("V4.3 TRAINING - 中等难度（建立信心版）")
+    print("V4.4 HIGH DIFFICULTY VALIDATION")
     print("=" * 60)
-    print("环境配置:")
-    print(f"  ✅ 静态障碍物: 8 个 (V4.2: 12)")
-    print(f"  ✅ 动态障碍物: 2 个 (V4.2: 4)")
-    print(f"  ✅ 奖励半径: 0.5 (V4.2: 0.4)")
-    print(f"  ✅ 碰撞惩罚: -0.6 (V4.2: -1.0)")
-    print(f"  ✅ 环境噪声: 0.06 (V4.2: 0.08)")
-    print(f"  ✅ 总训练量: {num_episodes} episodes")
+    print("策略:")
+    print("  ✅ 从 V4.3 冠军模型开始 (165.4 分)")
+    print("  ✅ 切换到 V4.2 高难度环境")
+    print("  ✅ 验证信心是否可迁移")
     print("=" * 60)
 
-    config = CuriosityConfigV43()
-    env = World2DMedium()
-    system = AdaptiveCuriositySystemV43(config)
+    config = CuriosityConfigV44()
+    env = World2DHighDifficulty()
+    system = AdaptiveCuriositySystemV44(config)
     visualizer = Visualizer2D() if render else None
+
+    # 关键：加载 V4.3 冠军模型
+    print("\n📥 加载 V4.3 冠军模型...")
+    if not system.load_v43_champion():
+        print("❌ 无法加载 V4.3 冠军模型，训练终止")
+        return None
 
     print(f"\n目标 Episodes: {num_episodes}")
     print(f"设备: {DEVICE}")
     print(f"高分锁定阈值: {config.high_score_threshold}")
+    print(f"V4.2 高难度环境: 12静态 + 4动态障碍物")
     print("-" * 60)
 
     total_start = time.time()
 
-    explore_rate = 0.40
-    explore_rate_min = 0.12
-    explore_rate_max = 0.50
+    # 探索率参数（从低探索率开始）
+    explore_rate = 0.15
+    explore_rate_min = 0.08
+    explore_rate_max = 0.25
     explore_smoothing = 0.98
 
     for episode in range(num_episodes):
@@ -933,15 +960,16 @@ def train_v43(num_episodes: int = 3000,
 
         episode_progress = episode / num_episodes
 
+        # 动态调整探索率
         if episode >= 50 and not system.is_high_score_lock_active():
             recent_returns = system.history['episode_returns'][-50:] if system.history['episode_returns'] else [0]
             recent_avg = np.mean(recent_returns)
 
-            if recent_avg > 130:
+            if recent_avg > 120:
                 target_rate = max(explore_rate_min, explore_rate * 0.97)
-            elif recent_avg > 110:
+            elif recent_avg > 100:
                 target_rate = max(explore_rate_min, explore_rate * 0.98)
-            elif recent_avg > 90:
+            elif recent_avg > 80:
                 target_rate = max(explore_rate_min, explore_rate * 0.99)
             elif recent_avg < 40:
                 target_rate = min(explore_rate_max, explore_rate * 1.03)
@@ -1043,10 +1071,8 @@ def train_v43(num_episodes: int = 3000,
 # 结果分析（保存到本地）
 # ============================================
 
-def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str = "v43_analysis.png"):
-    """
-    分析训练结果并保存图片到本地
-    """
+def analyze_and_save_results(system: AdaptiveCuriositySystemV44, save_path: str = "v44_analysis.png"):
+    """分析训练结果并保存图片到本地"""
     history = system.history
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -1062,7 +1088,7 @@ def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str 
                            c='gold', s=150, marker='*', zorder=5, label=f'Best: {system.best_return}')
     axes[0, 0].set_xlabel('Episode')
     axes[0, 0].set_ylabel('Return')
-    axes[0, 0].set_title(f'Episode Returns (Best: {system.best_return:.1f})')
+    axes[0, 0].set_title(f'V4.4 Episode Returns (Best: {system.best_return:.1f})')
     axes[0, 0].legend(loc='lower right', fontsize=8)
     axes[0, 0].grid(True, alpha=0.3)
 
@@ -1086,9 +1112,6 @@ def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str 
         axes[0, 2].set_title('Explore Rate Evolution')
         axes[0, 2].grid(True, alpha=0.3)
         axes[0, 2].set_ylim(0, 0.6)
-    else:
-        axes[0, 2].text(0.5, 0.5, 'No explore rate data', ha='center', va='center')
-        axes[0, 2].set_title('Explore Rate Evolution')
 
     # 4. 好奇心信号
     if history.get('novelty_values'):
@@ -1122,7 +1145,7 @@ def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str 
                    autopct='%1.1f%%', startangle=90)
     axes[1, 2].set_title(f'Final Weights (min={system.config.min_weight:.0%})')
 
-    plt.suptitle(f'V4.3 Training Analysis - Best: {system.best_return:.1f} points', fontsize=14)
+    plt.suptitle(f'V4.4 High Difficulty Validation - Best: {system.best_return:.1f} points', fontsize=14)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"📊 分析图片已保存: {save_path}")
@@ -1130,7 +1153,7 @@ def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str 
 
     # 打印统计报告
     print("\n" + "=" * 60)
-    print("训练统计报告 (V4.3)")
+    print("训练统计报告 (V4.4)")
     print("=" * 60)
     print(f"总 Episodes: {len(returns)}")
     print(f"平均奖励: {np.mean(returns):.2f} ± {np.std(returns):.2f}")
@@ -1140,11 +1163,11 @@ def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str 
         print(f"平均探索率: {np.mean(explore_rates):.3f}")
     print("=" * 60)
 
-    # 保存统计报告到文本文件
+    # 保存统计报告
     report_path = save_path.replace('.png', '_report.txt')
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("=" * 60 + "\n")
-        f.write("V4.3 训练统计报告\n")
+        f.write("V4.4 训练统计报告\n")
         f.write("=" * 60 + "\n")
         f.write(f"总 Episodes: {len(returns)}\n")
         f.write(f"平均奖励: {np.mean(returns):.2f} ± {np.std(returns):.2f}\n")
@@ -1156,44 +1179,36 @@ def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str 
     print(f"📄 统计报告已保存: {report_path}")
 
 
-
 # ============================================
 # 主程序
 # ============================================
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("🌙 V4.3 中等难度训练 - 建立信心")
+    print("🌙 V4.4 高难度验证训练")
     print("=" * 60)
-    print("预期目标: 150-180 分")
-    print("训练时间: 约 6-8 小时 (3000 episodes)")
+    print("策略:")
+    print("  - 从 V4.3 冠军模型开始 (165.4 分)")
+    print("  - 切换到 V4.2 高难度环境")
+    print("  - 验证信心是否可迁移")
+    print("  - 训练量: 2000 episodes")
     print("=" * 60)
 
-    # 检查是否有之前的检查点
-    checkpoint_path = "checkpoints_v43/champion_model_v43.pth"
-    if os.path.exists(checkpoint_path):
-        print(f"\n发现已有检查点: {checkpoint_path}")
-        choice = input("是否从检查点继续？(y/n): ").strip().lower()
-        resume = checkpoint_path if choice == 'y' else None
-    else:
-        resume = None
-
-    if resume:
-        print("从检查点继续训练...")
-    else:
-        print("从头开始训练...")
-
-    system = train_v43(
-        num_episodes=3000,
+    # 运行训练
+    system = train_v44(
+        num_episodes=2000,
         render=True,
         save_freq=100,
         verbose_freq=20
     )
 
-    # ========== 新增：分析并保存结果 ==========
-    print("\n" + "=" * 60)
-    print("生成分析报告...")
-    print("=" * 60)
-    analyze_and_save_results(system, save_path="v43_analysis.png")
+    if system:
+        # 分析并保存结果
+        print("\n" + "=" * 60)
+        print("生成分析报告...")
+        print("=" * 60)
+        analyze_and_save_results(system, save_path="v44_analysis.png")
 
-    print("\n✨ V4.3 训练完成！模型信心建立！✨")
+        print("\n✨ V4.4 训练完成！信心迁移验证完毕！✨")
+    else:
+        print("\n❌ V4.4 训练失败，请检查 V4.3 冠军模型是否存在")

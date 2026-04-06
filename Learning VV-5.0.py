@@ -1,16 +1,20 @@
 """
 ============================================
 Curiosity-Driven Exploration Framework
-VERSION 4.3 - 中等难度（建立信心版）
+VERSION 5.0 - 情感模块 + 好奇心驱动
 ============================================
-基于 V4.2 的成功经验，适度降低难度：
-- 静态障碍物: 12 → 8 个
-- 动态障碍物: 4 → 2 个
-- 奖励半径: 0.4 → 0.5
-- 碰撞惩罚: 1.0 → 0.6
-- 环境噪声: 0.08 → 0.06
+新增能力：
+1. 情感系统（依恋、沮丧、信心、情绪）
+2. 长期记忆（对成功区域的偏好）
+3. 情感影响决策
+4. 情绪调节探索率
+5. 信心驱动的学习率调整
 
-预期目标：150-180 分
+核心创新：
+- 模型不再只是“探索”，而是开始“感受”
+- 对成功的区域形成“依恋”
+- 连续失败时产生“沮丧”
+- 成功时增强“信心”
 ============================================
 """
 
@@ -36,7 +40,7 @@ import numpy as np
 from collections import deque
 import random
 from typing import List, Dict, Tuple, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -68,7 +72,195 @@ if torch.cuda.is_available():
 
 
 # ============================================
-# 动态障碍物类
+# V5.0 情感模块（核心新功能）
+# ============================================
+
+class EmotionalModule:
+    """
+    情感系统 - 让模型拥有情感和偏好
+
+    情感维度：
+    - 依恋 (Attachment): 对特定区域的偏好
+    - 沮丧 (Frustration): 连续失败时的负面情绪
+    - 信心 (Confidence): 对当前策略的信心
+    - 情绪 (Mood): 整体情绪基调
+    """
+
+    def __init__(self, decay_rate=0.98, frustration_threshold=0.5):
+        self.decay_rate = decay_rate
+        self.frustration_threshold = frustration_threshold
+
+        # 依恋强度 {zone_id: strength}
+        self.attachment = {}
+
+        # 情感状态
+        self.frustration = 0.0  # 0-1, 挫折感
+        self.confidence = 0.5  # 0-1, 信心值
+        self.mood = 0.0  # -1 到 1, 情绪基调
+        self.curiosity_emotion = 0.5  # 好奇心情绪
+
+        # 历史记录
+        self.reward_history = deque(maxlen=20)
+        self.success_streak = 0
+        self.failure_streak = 0
+
+        # 情感日志
+        self.history = {
+            'frustration': [],
+            'confidence': [],
+            'mood': [],
+            'attachment_strengths': []
+        }
+
+    def update(self, reward, zone_id, prediction_error, success=False):
+        """
+        更新情感状态
+
+        Args:
+            reward: 获得的奖励
+            zone_id: 当前所在的区域ID
+            prediction_error: 预测误差
+            success: 是否成功获得奖励
+        """
+        # 1. 更新依恋（对成功区域形成偏好）
+        if reward > 0 and zone_id is not None:
+            old_strength = self.attachment.get(zone_id, 0)
+            # 依恋强度增加，但有上限
+            new_strength = min(1.0, old_strength + 0.08)
+            self.attachment[zone_id] = new_strength
+
+        # 所有依恋随时间衰减
+        for zid in list(self.attachment.keys()):
+            self.attachment[zid] *= self.decay_rate
+            if self.attachment[zid] < 0.01:
+                del self.attachment[zid]
+
+        # 2. 更新成功/失败连击
+        if success:
+            self.success_streak += 1
+            self.failure_streak = 0
+        else:
+            self.failure_streak += 1
+            self.success_streak = 0
+
+        # 3. 更新沮丧感
+        if self.failure_streak >= 3:
+            self.frustration = min(1.0, self.frustration + 0.1)
+        else:
+            self.frustration = max(0.0, self.frustration - 0.05)
+
+        # 4. 更新信心
+        if prediction_error < 0.15:
+            self.confidence = min(1.0, self.confidence + 0.03)
+        elif prediction_error > 0.4:
+            self.confidence = max(0.2, self.confidence - 0.02)
+        else:
+            self.confidence = self.confidence * 0.99 + 0.5 * 0.01
+
+        # 5. 更新情绪基调
+        self.mood = 0.7 * self.mood + 0.3 * (reward - 0.5)
+        self.mood = np.clip(self.mood, -1, 1)
+
+        # 6. 更新好奇心情绪
+        self.curiosity_emotion = 0.9 * self.curiosity_emotion + 0.1 * prediction_error
+
+        # 记录历史
+        self.reward_history.append(reward)
+        self.history['frustration'].append(self.frustration)
+        self.history['confidence'].append(self.confidence)
+        self.history['mood'].append(self.mood)
+        if self.attachment:
+            self.history['attachment_strengths'].append(max(self.attachment.values()))
+        else:
+            self.history['attachment_strengths'].append(0)
+
+    def influence_explore_rate(self, base_explore_rate):
+        """
+        情感影响探索率
+
+        沮丧时增加探索（寻找新出路）
+        信心高时减少探索（专注利用）
+        """
+        adjusted_rate = base_explore_rate
+
+        # 沮丧增加探索
+        if self.frustration > self.frustration_threshold:
+            adjusted_rate = min(0.6, adjusted_rate + 0.1 * self.frustration)
+
+        # 信心高时减少探索
+        if self.confidence > 0.7:
+            adjusted_rate = max(0.05, adjusted_rate * 0.8)
+
+        # 情绪好时略微增加探索（积极探索）
+        if self.mood > 0.3:
+            adjusted_rate = min(0.5, adjusted_rate * 1.05)
+
+        return np.clip(adjusted_rate, 0.05, 0.6)
+
+    def influence_action(self, action, target_zone, available_zones):
+        """
+        情感影响动作选择
+
+        依恋区域：动作增强
+        沮丧时：增加随机性
+        """
+        influenced_action = action.copy()
+
+        # 依恋影响：对喜欢的区域更积极地靠近
+        if target_zone in self.attachment:
+            attachment_strength = self.attachment[target_zone]
+            # 依恋强度越高，动作越坚决
+            influenced_action = influenced_action * (1 + attachment_strength * 0.3)
+
+        # 沮丧影响：增加随机性（探索新路径）
+        if self.frustration > self.frustration_threshold:
+            noise = np.random.randn(2) * 0.2 * self.frustration
+            influenced_action = influenced_action + noise
+
+        # 信心影响：信心高时动作更精确
+        if self.confidence > 0.8:
+            # 减少动作噪声
+            pass
+
+        return np.clip(influenced_action, -1.0, 1.0)
+
+    def get_learning_rate_multiplier(self):
+        """情感影响学习率"""
+        # 信心低时学习率增加（更快学习）
+        if self.confidence < 0.4:
+            return 1.5
+        # 情绪差时学习率增加
+        if self.mood < -0.3:
+            return 1.3
+        return 1.0
+
+    def get_zone_preference(self, zone_id):
+        """获取对特定区域的偏好强度"""
+        return self.attachment.get(zone_id, 0)
+
+    def get_favorite_zone(self):
+        """获取最喜欢的区域"""
+        if not self.attachment:
+            return None
+        return max(self.attachment.items(), key=lambda x: x[1])[0]
+
+    def get_stats(self):
+        """获取情感统计信息"""
+        return {
+            'frustration': self.frustration,
+            'confidence': self.confidence,
+            'mood': self.mood,
+            'curiosity_emotion': self.curiosity_emotion,
+            'attachment_count': len(self.attachment),
+            'success_streak': self.success_streak,
+            'failure_streak': self.failure_streak,
+            'favorite_zone': self.get_favorite_zone(),
+            'max_attachment': max(self.attachment.values()) if self.attachment else 0
+        }
+
+
+# ============================================
+# V4.3 中等难度环境（最佳表现环境）
 # ============================================
 
 class DynamicObstacle:
@@ -108,15 +300,8 @@ class DynamicObstacle:
         self.vy = random.uniform(-self.speed, self.speed)
 
 
-# ============================================
-# V4.3 环境模拟器（中等难度）
-# ============================================
-
 class World2DMedium:
-    """
-    V4.3 中等难度环境
-    比 V4.1 难一点，比 V4.2 容易很多
-    """
+    """V4.3 中等难度环境（最佳表现）"""
 
     def __init__(self, world_size=12.0, friction=0.98,
                  reward_zones=None, static_obstacles=None,
@@ -128,18 +313,18 @@ class World2DMedium:
         self.max_steps = max_steps
         self.collision_penalty = collision_penalty
 
-        # 奖励区域：4个，半径 0.5（比 V4.2 的 0.4 大）
+        # 奖励区域：4个，半径 0.5
         if reward_zones is None:
             self.reward_zones = [
-                {'x': 4.0, 'y': 4.0, 'radius': 0.5, 'reward': 1.0},
-                {'x': -3.0, 'y': 3.0, 'radius': 0.5, 'reward': 1.0},
-                {'x': 2.0, 'y': -3.0, 'radius': 0.5, 'reward': 1.0},
-                {'x': -4.0, 'y': -2.0, 'radius': 0.5, 'reward': 1.0},
+                {'id': 0, 'x': 4.0, 'y': 4.0, 'radius': 0.5, 'reward': 1.0},
+                {'id': 1, 'x': -3.0, 'y': 3.0, 'radius': 0.5, 'reward': 1.0},
+                {'id': 2, 'x': 2.0, 'y': -3.0, 'radius': 0.5, 'reward': 1.0},
+                {'id': 3, 'x': -4.0, 'y': -2.0, 'radius': 0.5, 'reward': 1.0},
             ]
         else:
             self.reward_zones = reward_zones
 
-        # 静态障碍物：8个（比 V4.2 的 12 个少）
+        # 静态障碍物：8个
         if static_obstacles is None:
             self.static_obstacles = [
                 {'x': 0, 'y': 0, 'radius': 0.8},
@@ -154,7 +339,7 @@ class World2DMedium:
         else:
             self.static_obstacles = static_obstacles
 
-        # 动态障碍物：2个（比 V4.2 的 4 个少）
+        # 动态障碍物：2个
         if dynamic_obstacles is None:
             self.dynamic_obstacles = [
                 DynamicObstacle(2.0, 1.0, 0.4, 0.25),
@@ -167,7 +352,6 @@ class World2DMedium:
         self.reset()
 
     def reset(self, extreme=True):
-        # 从角落或边缘开始
         corners = [
             (-self.world_size / 2 + 0.8, -self.world_size / 2 + 0.8),
             (-self.world_size / 2 + 0.8, self.world_size / 2 - 0.8),
@@ -178,7 +362,6 @@ class World2DMedium:
         self.vx = random.uniform(-1.5, 1.5)
         self.vy = random.uniform(-1.5, 1.5)
 
-        # 确保起始位置不在障碍物内
         while self._check_collision(self.x, self.y, check_dynamic=False):
             self.x = np.random.uniform(-self.world_size / 2, self.world_size / 2)
             self.y = np.random.uniform(-self.world_size / 2, self.world_size / 2)
@@ -188,10 +371,20 @@ class World2DMedium:
 
         self.step_count = 0
         self.collision_count = 0
+        self.current_zone = None
         return self._get_state()
 
     def _get_state(self):
         return np.array([self.x, self.y, self.vx, self.vy])
+
+    def _get_current_zone(self):
+        for zone in self.reward_zones:
+            dx = self.x - zone['x']
+            dy = self.y - zone['y']
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < zone['radius']:
+                return zone['id']
+        return None
 
     def _check_collision(self, x, y, check_dynamic=True):
         for obs in self.static_obstacles:
@@ -307,7 +500,7 @@ class World2DMedium:
 
 
 # ============================================
-# 好奇心机制模块（与 V4.2 相同）
+# 好奇心机制模块（与之前相同）
 # ============================================
 
 class PredictionErrorCuriosity(nn.Module):
@@ -493,11 +686,11 @@ class ContributionTracker:
 
 
 # ============================================
-# 自适应好奇心系统（V4.3）
+# 自适应好奇心系统（V5.0 - 集成情感）
 # ============================================
 
 @dataclass
-class CuriosityConfigV43:
+class CuriosityConfigV5:
     state_dim: int = 4
     action_dim: int = 2
     num_mechanisms: int = 3
@@ -507,17 +700,17 @@ class CuriosityConfigV43:
     weight_update_freq: int = 10
     credit_gamma: float = 0.95
     save_freq: int = 100
-    checkpoint_dir: str = "checkpoints_v43"
+    checkpoint_dir: str = "checkpoints_v5"
     min_weight: float = 0.10
     novelty_reset_freq: int = 500
-    exploration_bonus: float = 0.08
+    exploration_bonus: float = 0.05
     weight_reset_threshold: float = 0.95
-    high_score_threshold: float = 140
+    high_score_threshold: float = 150
     lock_duration: int = 80
 
 
-class AdaptiveCuriositySystemV43:
-    def __init__(self, config: CuriosityConfigV43):
+class AdaptiveCuriositySystemV5:
+    def __init__(self, config: CuriosityConfigV5):
         self.config = config
         self.num = config.num_mechanisms
 
@@ -533,11 +726,16 @@ class AdaptiveCuriositySystemV43:
 
         self.tracker = ContributionTracker(config.num_mechanisms, config.credit_gamma)
 
+        # 【V5.0 核心】情感模块
+        self.emotion = EmotionalModule()
+
         self.history = {
             'episode_returns': [], 'weights_history': [], 'curiosity_history': [],
             'pred_errors': [], 'rnd_errors': [], 'novelty_values': [],
             'timestamps': [], 'episode_times': [], 'mechanism_credits': [],
-            'explore_rates': [], 'collision_rates': []
+            'explore_rates': [], 'collision_rates': [],
+            # V5.0 情感历史
+            'frustration': [], 'confidence': [], 'mood': [], 'attachment_strengths': []
         }
 
         self.step_count = 0
@@ -550,7 +748,7 @@ class AdaptiveCuriositySystemV43:
         self.best_episode = 0
         self.high_score_lock_counter = 0
 
-        self.champion_path = os.path.join(config.checkpoint_dir, "champion_model_v43.pth")
+        self.champion_path = os.path.join(config.checkpoint_dir, "champion_model_v5.pth")
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     @property
@@ -570,8 +768,15 @@ class AdaptiveCuriositySystemV43:
         weights = self.weights
         weighted_sum = np.sum(weights * values)
 
+        # 情感影响好奇心
+        emotion_multiplier = 1.0
+        if self.emotion.mood > 0.3:
+            emotion_multiplier = 1.1  # 好情绪增强好奇心
+        elif self.emotion.mood < -0.3:
+            emotion_multiplier = 0.9  # 坏情绪抑制好奇心
+
         exploration_bonus = self.config.exploration_bonus * (1 - episode_progress) * 0.5
-        total_curiosity = weighted_sum + exploration_bonus
+        total_curiosity = weighted_sum * emotion_multiplier + exploration_bonus
 
         self._current_curiosity = values
         self._current_weights = weights
@@ -597,7 +802,7 @@ class AdaptiveCuriositySystemV43:
         if self.step_count % self.config.weight_update_freq == 0:
             self._update_weights()
 
-    def end_episode(self, episode_return, episode_time, details=None, collision_rate=0):
+    def end_episode(self, episode_return, episode_time, details=None, collision_rate=0, zone_id=None):
         credit = self.tracker.compute_credit()
         self._update_weights_from_credit(credit)
 
@@ -607,6 +812,13 @@ class AdaptiveCuriositySystemV43:
         self.history['timestamps'].append(time.time() - self.start_time)
         self.history['mechanism_credits'].append(credit)
         self.history['collision_rates'].append(collision_rate)
+
+        # 【V5.0】记录情感历史
+        emotion_stats = self.emotion.get_stats()
+        self.history['frustration'].append(emotion_stats['frustration'])
+        self.history['confidence'].append(emotion_stats['confidence'])
+        self.history['mood'].append(emotion_stats['mood'])
+        self.history['attachment_strengths'].append(emotion_stats['max_attachment'])
 
         if details:
             self.history['pred_errors'].append(details.get('pred_error', 0))
@@ -642,21 +854,18 @@ class AdaptiveCuriositySystemV43:
     def is_high_score_lock_active(self):
         return self.high_score_lock_counter > 0
 
-    def _save_champion(self):
-        champion_checkpoint = {
-            'episode': self.episode_count,
-            'return': self.best_return,
-            'weights_logits': self.weights_logits.detach().cpu(),
-            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
-            'novelty_memory': list(self.mechanisms['novelty'].memory),
-            'novelty_count': self.mechanisms['novelty'].exploration_count,
-            'rnd_predictor_state': self.mechanisms['rnd'].predictor.state_dict(),
-            'rnd_mean': self.mechanisms['rnd'].mean.cpu(),
-            'rnd_std': self.mechanisms['rnd'].std.cpu(),
-            'rnd_count': self.mechanisms['rnd'].count.cpu(),
-            'timestamp': datetime.now().isoformat()
-        }
-        torch.save(champion_checkpoint, self.champion_path)
+    def get_emotion_influence(self, base_explore_rate):
+        """获取情感影响的探索率"""
+        return self.emotion.influence_explore_rate(base_explore_rate)
+
+    def influence_action_with_emotion(self, action, target_zone, available_zones):
+        """用情感影响动作"""
+        return self.emotion.influence_action(action, target_zone, available_zones)
+
+    def update_emotion(self, reward, zone_id, prediction_error):
+        """更新情感状态"""
+        success = reward > 0
+        self.emotion.update(reward, zone_id, prediction_error, success)
 
     def _update_weights(self):
         if len(self.history['episode_returns']) < 5:
@@ -682,29 +891,22 @@ class AdaptiveCuriositySystemV43:
         loss.backward()
         self.weights_optimizer.step()
 
-    def save_checkpoint(self):
-        checkpoint = {
+    def _save_champion(self):
+        champion_checkpoint = {
             'episode': self.episode_count,
-            'step': self.step_count,
+            'return': self.best_return,
             'weights_logits': self.weights_logits.detach().cpu(),
-            'weights_optimizer': self.weights_optimizer.state_dict(),
-            'history': self.history,
-            'best_return': self.best_return,
-            'best_episode': self.best_episode,
-            'high_score_lock_counter': self.high_score_lock_counter,
+            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
             'novelty_memory': list(self.mechanisms['novelty'].memory),
             'novelty_count': self.mechanisms['novelty'].exploration_count,
-            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
-            'pred_error_optimizer': self.mechanisms['prediction_error'].optimizer.state_dict(),
             'rnd_predictor_state': self.mechanisms['rnd'].predictor.state_dict(),
-            'rnd_optimizer': self.mechanisms['rnd'].optimizer.state_dict(),
             'rnd_mean': self.mechanisms['rnd'].mean.cpu(),
             'rnd_std': self.mechanisms['rnd'].std.cpu(),
             'rnd_count': self.mechanisms['rnd'].count.cpu(),
+            'emotion_attachment': self.emotion.attachment,
+            'timestamp': datetime.now().isoformat()
         }
-        path = f"{self.config.checkpoint_dir}/checkpoint_ep{self.episode_count}.pth"
-        torch.save(checkpoint, path)
-        print(f"   💾 检查点已保存: {path}")
+        torch.save(champion_checkpoint, self.champion_path)
 
     def load_checkpoint(self, path):
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
@@ -733,12 +935,63 @@ class AdaptiveCuriositySystemV43:
         self.mechanisms['rnd'].std = checkpoint['rnd_std'].to(DEVICE)
         self.mechanisms['rnd'].count = checkpoint['rnd_count'].to(DEVICE)
 
+        # 恢复情感模块的依恋
+        if 'emotion_attachment' in checkpoint:
+            self.emotion.attachment = checkpoint['emotion_attachment']
+
         print(f"✅ 从检查点恢复: Episode {self.episode_count}")
         print(f"🏆 历史最佳: Episode {self.best_episode}, Return {self.best_return:.2f}")
         return self.episode_count
 
+    def load_v43_champion(self):
+        """加载 V4.3 冠军模型作为起点"""
+        v43_champion_path = "checkpoints_v43/champion_model_v43.pth"
+        if os.path.exists(v43_champion_path):
+            checkpoint = torch.load(v43_champion_path, map_location='cpu', weights_only=False)
+            self.weights_logits.data = checkpoint['weights_logits'].to(DEVICE)
+            self.mechanisms['prediction_error'].load_state_dict(checkpoint['pred_error_state'])
+            self.mechanisms['novelty'].memory = deque(checkpoint['novelty_memory'], maxlen=15000)
+            self.mechanisms['novelty'].exploration_count = checkpoint['novelty_count']
+            self.mechanisms['rnd'].predictor.load_state_dict(checkpoint['rnd_predictor_state'])
+            self.mechanisms['rnd'].mean = checkpoint['rnd_mean'].to(DEVICE)
+            self.mechanisms['rnd'].std = checkpoint['rnd_std'].to(DEVICE)
+            self.mechanisms['rnd'].count = checkpoint['rnd_count'].to(DEVICE)
+            self.best_return = checkpoint.get('return', 0)
+            self.best_episode = checkpoint.get('episode', 0)
+            print(f"🏆 V4.3 冠军模型已加载 (Episode {self.best_episode}, Return {self.best_return:.2f})")
+            return True
+        else:
+            print("⚠️ 未找到 V4.3 冠军模型")
+            return False
+
+    def save_checkpoint(self):
+        checkpoint = {
+            'episode': self.episode_count,
+            'step': self.step_count,
+            'weights_logits': self.weights_logits.detach().cpu(),
+            'weights_optimizer': self.weights_optimizer.state_dict(),
+            'history': self.history,
+            'best_return': self.best_return,
+            'best_episode': self.best_episode,
+            'high_score_lock_counter': self.high_score_lock_counter,
+            'novelty_memory': list(self.mechanisms['novelty'].memory),
+            'novelty_count': self.mechanisms['novelty'].exploration_count,
+            'pred_error_state': self.mechanisms['prediction_error'].state_dict(),
+            'pred_error_optimizer': self.mechanisms['prediction_error'].optimizer.state_dict(),
+            'rnd_predictor_state': self.mechanisms['rnd'].predictor.state_dict(),
+            'rnd_optimizer': self.mechanisms['rnd'].optimizer.state_dict(),
+            'rnd_mean': self.mechanisms['rnd'].mean.cpu(),
+            'rnd_std': self.mechanisms['rnd'].std.cpu(),
+            'rnd_count': self.mechanisms['rnd'].count.cpu(),
+            'emotion_attachment': self.emotion.attachment,
+        }
+        path = f"{self.config.checkpoint_dir}/checkpoint_ep{self.episode_count}.pth"
+        torch.save(checkpoint, path)
+        print(f"   💾 检查点已保存: {path}")
+
     def get_stats(self):
         recent_returns = self.history['episode_returns'][-20:] if self.history['episode_returns'] else []
+        emotion_stats = self.emotion.get_stats()
         return {
             'weights': self.weights.tolist(),
             'episode': self.episode_count,
@@ -746,15 +999,16 @@ class AdaptiveCuriositySystemV43:
             'avg_return': np.mean(recent_returns) if recent_returns else 0,
             'total_time': time.time() - self.start_time,
             'best_return': self.best_return,
-            'best_episode': self.best_episode
+            'best_episode': self.best_episode,
+            'emotion': emotion_stats
         }
 
 
 # ============================================
-# 可视化工具
+# 可视化工具（V5.0 - 新增情感图表）
 # ============================================
 
-class Visualizer2D:
+class Visualizer2DV5:
     def __init__(self):
         self.fig = None
         self.axes = None
@@ -762,23 +1016,26 @@ class Visualizer2D:
 
     def setup(self):
         plt.close('all')
-        self.fig = plt.figure(figsize=(16, 10))
-        gs = self.fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+        self.fig = plt.figure(figsize=(18, 12))
+        gs = self.fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
 
         self.axes = {
             'trajectory': self.fig.add_subplot(gs[0, :2]),
             'returns': self.fig.add_subplot(gs[0, 2]),
             'weights': self.fig.add_subplot(gs[1, 0]),
             'curiosity': self.fig.add_subplot(gs[1, 1]),
-            'credit': self.fig.add_subplot(gs[1, 2])
+            'emotion': self.fig.add_subplot(gs[1, 2]),
+            'explore': self.fig.add_subplot(gs[2, 0]),
+            'credit': self.fig.add_subplot(gs[2, 1]),
+            'attachment': self.fig.add_subplot(gs[2, 2])
         }
 
-        self.fig.suptitle('2D Exploration - V4.3 (中等难度，建立信心)', fontsize=14, fontweight='bold')
+        self.fig.suptitle('V5.0 Emotional Curiosity - 有情感的智能体', fontsize=14, fontweight='bold')
         self.initialized = True
         plt.ion()
         plt.show()
 
-    def update_trajectory(self, ax, positions, reward_zones, static_obstacles, dynamic_obstacles, current_pos=None):
+    def update_trajectory(self, ax, positions, reward_zones, static_obstacles, dynamic_obstacles, current_state=None):
         ax.clear()
 
         for obs in static_obstacles:
@@ -804,12 +1061,12 @@ class Visualizer2D:
         ax.set_ylim(-7, 7)
         ax.set_xlabel('X Position')
         ax.set_ylabel('Y Position')
-        ax.set_title('2D Trajectory with Obstacles')
+        ax.set_title('2D Trajectory')
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper right', fontsize=8)
         ax.set_aspect('equal')
 
-    def update(self, system, env, positions, current_state=None):
+    def update(self, system, env, positions, current_state=None, explore_rate=None):
         if not self.initialized:
             self.setup()
 
@@ -822,6 +1079,7 @@ class Visualizer2D:
                                env.reward_zones, env.static_obstacles,
                                env.dynamic_obstacles, current_state)
 
+        # 奖励曲线
         ax = self.axes['returns']
         ax.clear()
         if history['episode_returns']:
@@ -835,9 +1093,10 @@ class Visualizer2D:
                            c='gold', s=100, marker='*', zorder=5)
             ax.set_xlabel('Episode')
             ax.set_ylabel('Return')
-            ax.set_title(f'Returns (Avg: {stats["avg_return"]:.1f}, Best: {stats["best_return"]:.1f})')
+            ax.set_title(f'Returns (Best: {stats["best_return"]:.1f})')
             ax.grid(True, alpha=0.3)
 
+        # 权重演化
         ax = self.axes['weights']
         ax.clear()
         if history['weights_history']:
@@ -851,6 +1110,7 @@ class Visualizer2D:
             ax.grid(True, alpha=0.3)
             ax.set_ylim(0, 1)
 
+        # 好奇心信号
         ax = self.axes['curiosity']
         ax.clear()
         if history.get('novelty_values'):
@@ -865,6 +1125,36 @@ class Visualizer2D:
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
+        # 情感演化（新！）
+        ax = self.axes['emotion']
+        ax.clear()
+        if history.get('frustration'):
+            ax.plot(history['frustration'], label='Frustration', color='red', alpha=0.7)
+        if history.get('confidence'):
+            ax.plot(history['confidence'], label='Confidence', color='green', alpha=0.7)
+        if history.get('mood'):
+            ax.plot(history['mood'], label='Mood', color='purple', alpha=0.7)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Value')
+        ax.set_title('Emotion Evolution')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.2, 1.2)
+
+        # 探索率
+        ax = self.axes['explore']
+        ax.clear()
+        if history.get('explore_rates'):
+            ax.plot(history['explore_rates'], 'b-', alpha=0.7)
+            if explore_rate is not None:
+                ax.axhline(y=explore_rate, color='r', linestyle='--', label=f'Current: {explore_rate:.3f}')
+            ax.set_xlabel('Episode')
+            ax.set_ylabel('Explore Rate')
+            ax.set_title('Explore Rate Evolution')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 0.6)
+
+        # 信用分配
         ax = self.axes['credit']
         ax.clear()
         if history.get('mechanism_credits') and len(history['mechanism_credits']) > 0:
@@ -872,6 +1162,17 @@ class Visualizer2D:
             ax.bar(labels, recent, color=colors)
             ax.set_ylabel('Credit')
             ax.set_title('Recent Credit Distribution')
+
+        # 依恋强度（新！）
+        ax = self.axes['attachment']
+        ax.clear()
+        if history.get('attachment_strengths'):
+            ax.plot(history['attachment_strengths'], 'orange', alpha=0.7, linewidth=1.5)
+            ax.set_xlabel('Episode')
+            ax.set_ylabel('Max Attachment')
+            ax.set_title('Attachment Strength Evolution')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 1)
 
         plt.tight_layout()
         self.fig.canvas.draw_idle()
@@ -885,30 +1186,32 @@ class Visualizer2D:
 
 
 # ============================================
-# 训练函数（V4.3）
+# 训练函数（V5.0）
 # ============================================
 
-def train_v43(num_episodes: int = 3000,
-              render: bool = True,
-              save_freq: int = 100,
-              verbose_freq: int = 20):
-    """V4.3 训练函数 - 中等难度，建立信心"""
+def train_v5(num_episodes: int = 3000,
+             render: bool = True,
+             save_freq: int = 100,
+             verbose_freq: int = 20):
+    """V5.0 训练 - 情感好奇心"""
     print("=" * 60)
-    print("V4.3 TRAINING - 中等难度（建立信心版）")
+    print("V5.0 EMOTIONAL CURIOSITY TRAINING")
     print("=" * 60)
-    print("环境配置:")
-    print(f"  ✅ 静态障碍物: 8 个 (V4.2: 12)")
-    print(f"  ✅ 动态障碍物: 2 个 (V4.2: 4)")
-    print(f"  ✅ 奖励半径: 0.5 (V4.2: 0.4)")
-    print(f"  ✅ 碰撞惩罚: -0.6 (V4.2: -1.0)")
-    print(f"  ✅ 环境噪声: 0.06 (V4.2: 0.08)")
-    print(f"  ✅ 总训练量: {num_episodes} episodes")
+    print("新能力:")
+    print("  ✅ 情感系统（依恋、沮丧、信心、情绪）")
+    print("  ✅ 情感影响探索率")
+    print("  ✅ 情感影响动作选择")
+    print("  ✅ 对成功区域形成依恋")
     print("=" * 60)
 
-    config = CuriosityConfigV43()
+    config = CuriosityConfigV5()
     env = World2DMedium()
-    system = AdaptiveCuriositySystemV43(config)
-    visualizer = Visualizer2D() if render else None
+    system = AdaptiveCuriositySystemV5(config)
+    visualizer = Visualizer2DV5() if render else None
+
+    # 加载 V4.3 冠军模型作为起点
+    print("\n📥 加载 V4.3 冠军模型作为起点...")
+    system.load_v43_champion()
 
     print(f"\n目标 Episodes: {num_episodes}")
     print(f"设备: {DEVICE}")
@@ -917,10 +1220,10 @@ def train_v43(num_episodes: int = 3000,
 
     total_start = time.time()
 
-    explore_rate = 0.40
-    explore_rate_min = 0.12
-    explore_rate_max = 0.50
-    explore_smoothing = 0.98
+    # 探索率参数（情感会影响实际探索率）
+    base_explore_rate = 0.15
+    explore_rate_min = 0.08
+    explore_rate_max = 0.30
 
     for episode in range(num_episodes):
         state = env.reset(extreme=True)
@@ -933,52 +1236,50 @@ def train_v43(num_episodes: int = 3000,
 
         episode_progress = episode / num_episodes
 
-        if episode >= 50 and not system.is_high_score_lock_active():
-            recent_returns = system.history['episode_returns'][-50:] if system.history['episode_returns'] else [0]
-            recent_avg = np.mean(recent_returns)
-
-            if recent_avg > 130:
-                target_rate = max(explore_rate_min, explore_rate * 0.97)
-            elif recent_avg > 110:
-                target_rate = max(explore_rate_min, explore_rate * 0.98)
-            elif recent_avg > 90:
-                target_rate = max(explore_rate_min, explore_rate * 0.99)
-            elif recent_avg < 40:
-                target_rate = min(explore_rate_max, explore_rate * 1.03)
-            else:
-                target_rate = explore_rate
-        else:
-            target_rate = explore_rate
-
-        if system.is_high_score_lock_active():
-            target_rate = explore_rate_min
-
-        explore_rate = explore_smoothing * explore_rate + (1 - explore_smoothing) * target_rate
+        # 情感影响探索率
+        explore_rate = system.get_emotion_influence(base_explore_rate)
         explore_rate = np.clip(explore_rate, explore_rate_min, explore_rate_max)
 
         system.history['explore_rates'].append(explore_rate)
 
         for step in range(env.max_steps):
-            if random.random() < explore_rate:
-                action = np.random.uniform(-1.0, 1.0, size=2)
+            # 获取当前区域（用于情感更新）
+            current_zone = env._get_current_zone()
+
+            # 选择目标区域（依恋影响）
+            favorite_zone = system.emotion.get_favorite_zone()
+            if favorite_zone is not None and random.random() < 0.7:
+                target_zone = env.reward_zones[favorite_zone]
             else:
-                nearest_zone = min(env.reward_zones,
-                                   key=lambda z: ((state[0] - z['x']) ** 2 + (state[1] - z['y']) ** 2) ** 0.5)
-                dx = nearest_zone['x'] - state[0]
-                dy = nearest_zone['y'] - state[1]
+                target_zone = min(env.reward_zones,
+                                  key=lambda z: ((state[0] - z['x']) ** 2 + (state[1] - z['y']) ** 2) ** 0.5)
+
+            # 动作选择
+            if random.random() < explore_rate:
+                action = np.random.uniform(-0.8, 0.8, size=2)
+            else:
+                dx = target_zone['x'] - state[0]
+                dy = target_zone['y'] - state[1]
                 dist = math.sqrt(dx * dx + dy * dy)
                 if dist > 0.1:
-                    action = np.array([np.clip(dx / dist, -1.0, 1.0), np.clip(dy / dist, -1.0, 1.0)])
+                    action = np.array([np.clip(dx / dist, -0.8, 0.8), np.clip(dy / dist, -0.8, 0.8)])
                 else:
                     action = np.zeros(2)
+
+            # 情感影响动作
+            action = system.influence_action_with_emotion(action, target_zone['id'], env.reward_zones)
 
             next_state, reward, done = env.step(action)
             curiosity, details = system.compute_curiosity(state, action, next_state, episode_progress)
             system.record_step(state, action, reward, next_state)
 
+            # 更新情感
+            prediction_error = details.get('pred_error', 0)
+            system.update_emotion(reward, current_zone, prediction_error)
+
             episode_return += reward
             episode_steps += 1
-            episode_details['pred_error'] += details.get('pred_error', 0)
+            episode_details['pred_error'] += prediction_error
             episode_details['rnd_error'] += details.get('rnd_error', 0)
             episode_details['novelty'] += details.get('novelty', 0)
 
@@ -995,10 +1296,10 @@ def train_v43(num_episodes: int = 3000,
 
         collision_rate = env.get_collision_rate()
         episode_time = time.time() - episode_start
-        system.end_episode(episode_return, episode_time, episode_details, collision_rate)
+        system.end_episode(episode_return, episode_time, episode_details, collision_rate, current_zone)
 
         if visualizer and episode % 5 == 0 and positions:
-            visualizer.update(system, env, positions, state)
+            visualizer.update(system, env, positions, state, explore_rate)
             plt.pause(0.01)
 
         if (episode + 1) % verbose_freq == 0:
@@ -1006,6 +1307,7 @@ def train_v43(num_episodes: int = 3000,
             elapsed = time.time() - total_start
             weights = system.weights
             lock_status = "🔒" if system.is_high_score_lock_active() else "  "
+            emotion = stats['emotion']
             recent_avg = np.mean(system.history['episode_returns'][-50:]) if system.history['episode_returns'] else 0
             print(f"Ep {episode + 1:4d}/{num_episodes} | "
                   f"Return: {episode_return:7.2f} | "
@@ -1013,11 +1315,21 @@ def train_v43(num_episodes: int = 3000,
                   f"Best: {stats['best_return']:.1f} {lock_status} | "
                   f"Weights: [{weights[0]:.2f},{weights[1]:.2f},{weights[2]:.2f}] | "
                   f"Explore: {explore_rate:.3f} | "
-                  f"Coll: {collision_rate:.2f} | "
+                  f"❤️ {emotion['confidence']:.2f} | "
+                  f"😤 {emotion['frustration']:.2f} | "
                   f"Time: {elapsed / 60:.1f}min")
 
-        if (episode + 1) % 100 == 0 and torch.cuda.is_available():
-            print(f"   📊 GPU: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        # 每 100 episodes 打印情感摘要
+        if (episode + 1) % 100 == 0:
+            emotion = system.emotion.get_stats()
+            print(f"   📊 情感摘要: 信心={emotion['confidence']:.2f}, "
+                  f"沮丧={emotion['frustration']:.2f}, "
+                  f"依恋区域数={emotion['attachment_count']}, "
+                  f"最爱区域={emotion['favorite_zone']}")
+
+        # 每 50 episodes 更新基础探索率（缓慢衰减）
+        if (episode + 1) % 50 == 0:
+            base_explore_rate = max(0.10, base_explore_rate * 0.98)
 
     total_time = time.time() - total_start
     print("-" * 60)
@@ -1030,6 +1342,16 @@ def train_v43(num_episodes: int = 3000,
         print(f"平均 Episode 奖励 (最后100): {np.mean(recent):.2f}")
         print(f"最佳 Episode 奖励: {system.best_return:.2f} (Episode {system.best_episode})")
 
+    # 打印最终情感状态
+    emotion = system.emotion.get_stats()
+    print(f"\n❤️ 最终情感状态:")
+    print(f"   信心: {emotion['confidence']:.2f}")
+    print(f"   沮丧: {emotion['frustration']:.2f}")
+    print(f"   情绪: {emotion['mood']:.2f}")
+    print(f"   依恋区域: {emotion['attachment_count']} 个")
+    print(f"   最爱区域: {emotion['favorite_zone']}")
+    print(f"   最强依恋: {emotion['max_attachment']:.2f}")
+
     system.save_checkpoint()
     print(f"🏆 冠军模型已保存至: {system.champion_path}")
 
@@ -1040,121 +1362,87 @@ def train_v43(num_episodes: int = 3000,
 
 
 # ============================================
-# 结果分析（保存到本地）
+# 结果分析（V5.0）
 # ============================================
 
-def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str = "v43_analysis.png"):
-    """
-    分析训练结果并保存图片到本地
-    """
+def analyze_and_save_results(system: AdaptiveCuriositySystemV5, save_path: str = "v5_analysis.png"):
+    """分析训练结果并保存图片"""
     history = system.history
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
     # 1. 奖励曲线
     returns = history['episode_returns']
-    axes[0, 0].plot(returns, alpha=0.5, linewidth=0.8)
+    axes[0, 0].plot(returns, alpha=0.5)
     if len(returns) >= 50:
         smooth = np.convolve(returns, np.ones(50) / 50, mode='valid')
-        axes[0, 0].plot(range(49, len(returns)), smooth, 'r-', linewidth=2, label='Moving Avg (50)')
+        axes[0, 0].plot(range(49, len(returns)), smooth, 'r-', linewidth=2)
     if system.best_episode > 0:
         axes[0, 0].scatter(system.best_episode - 1, system.best_return,
-                           c='gold', s=150, marker='*', zorder=5, label=f'Best: {system.best_return}')
+                           c='gold', s=150, marker='*', zorder=5)
+    axes[0, 0].set_title(f'Episode Returns (Best: {system.best_return:.1f})')
     axes[0, 0].set_xlabel('Episode')
     axes[0, 0].set_ylabel('Return')
-    axes[0, 0].set_title(f'Episode Returns (Best: {system.best_return:.1f})')
-    axes[0, 0].legend(loc='lower right', fontsize=8)
-    axes[0, 0].grid(True, alpha=0.3)
 
     # 2. 权重演化
     weights = np.array(history['weights_history'])
     for i, label in enumerate(['Prediction Error', 'Novelty', 'RND']):
-        axes[0, 1].plot(weights[:, i], label=label, linewidth=1.5)
+        axes[0, 1].plot(weights[:, i], label=label)
+    axes[0, 1].set_title('Weights Evolution')
     axes[0, 1].set_xlabel('Episode')
     axes[0, 1].set_ylabel('Weight')
-    axes[0, 1].set_title('Weights Evolution')
-    axes[0, 1].legend(fontsize=8)
-    axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].legend()
 
-    # 3. 探索率演化
-    explore_rates = history.get('explore_rates', [])
-    if explore_rates:
-        axes[0, 2].plot(explore_rates, 'b-', alpha=0.7, linewidth=1.5)
-        axes[0, 2].set_xlabel('Episode')
-        axes[0, 2].set_ylabel('Explore Rate')
-        axes[0, 2].set_title('Explore Rate Evolution')
-        axes[0, 2].grid(True, alpha=0.3)
-        axes[0, 2].set_ylim(0, 0.6)
-    else:
-        axes[0, 2].text(0.5, 0.5, 'No explore rate data', ha='center', va='center')
-        axes[0, 2].set_title('Explore Rate Evolution')
+    # 3. 情感演化
+    if history.get('confidence'):
+        axes[0, 2].plot(history['confidence'], label='Confidence', color='green')
+    if history.get('frustration'):
+        axes[0, 2].plot(history['frustration'], label='Frustration', color='red')
+    if history.get('mood'):
+        axes[0, 2].plot(history['mood'], label='Mood', color='purple')
+    axes[0, 2].set_title('Emotion Evolution')
+    axes[0, 2].set_xlabel('Episode')
+    axes[0, 2].legend()
 
     # 4. 好奇心信号
     if history.get('novelty_values'):
-        axes[1, 0].plot(history['novelty_values'], label='Novelty', alpha=0.7, linewidth=1.5)
+        axes[1, 0].plot(history['novelty_values'], label='Novelty')
     if history.get('pred_errors'):
-        axes[1, 0].plot(history['pred_errors'], label='Pred Error', alpha=0.7, linewidth=1.5)
+        axes[1, 0].plot(history['pred_errors'], label='Pred Error')
     if history.get('rnd_errors'):
-        axes[1, 0].plot(history['rnd_errors'], label='RND Error', alpha=0.7, linewidth=1.5)
-    axes[1, 0].set_xlabel('Episode')
-    axes[1, 0].set_ylabel('Value')
+        axes[1, 0].plot(history['rnd_errors'], label='RND Error')
     axes[1, 0].set_title('Curiosity Signals')
-    axes[1, 0].legend(fontsize=8)
-    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].set_xlabel('Episode')
+    axes[1, 0].legend()
 
-    # 5. 奖励分布直方图
-    axes[1, 1].hist(returns, bins=30, edgecolor='black', alpha=0.7, color='steelblue')
-    axes[1, 1].axvline(np.mean(returns), color='red', linestyle='--',
-                       linewidth=2, label=f'Mean: {np.mean(returns):.1f}')
-    axes[1, 1].axvline(system.best_return, color='gold', linestyle='--',
-                       linewidth=2, label=f'Best: {system.best_return:.1f}')
-    axes[1, 1].set_xlabel('Return')
-    axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].set_title('Reward Distribution')
-    axes[1, 1].legend(fontsize=8)
+    # 5. 探索率
+    if history.get('explore_rates'):
+        axes[1, 1].plot(history['explore_rates'], 'b-', alpha=0.7)
+        axes[1, 1].set_title('Explore Rate Evolution')
+        axes[1, 1].set_xlabel('Episode')
+        axes[1, 1].set_ylabel('Explore Rate')
 
-    # 6. 最终权重饼图
-    final_weights = system.weights
-    colors = ['#ff6b6b', '#4ecdc4', '#45b7d1']
-    labels = ['Prediction Error', 'Novelty', 'RND']
-    axes[1, 2].pie(final_weights, labels=labels, colors=colors,
-                   autopct='%1.1f%%', startangle=90)
-    axes[1, 2].set_title(f'Final Weights (min={system.config.min_weight:.0%})')
+    # 6. 依恋强度
+    if history.get('attachment_strengths'):
+        axes[1, 2].plot(history['attachment_strengths'], 'orange', alpha=0.7)
+        axes[1, 2].set_title('Attachment Strength')
+        axes[1, 2].set_xlabel('Episode')
+        axes[1, 2].set_ylabel('Max Attachment')
 
-    plt.suptitle(f'V4.3 Training Analysis - Best: {system.best_return:.1f} points', fontsize=14)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"📊 分析图片已保存: {save_path}")
     plt.show()
 
-    # 打印统计报告
     print("\n" + "=" * 60)
-    print("训练统计报告 (V4.3)")
+    print("训练统计报告 (V5.0 - 情感好奇心)")
     print("=" * 60)
     print(f"总 Episodes: {len(returns)}")
     print(f"平均奖励: {np.mean(returns):.2f} ± {np.std(returns):.2f}")
     print(f"最佳奖励: {system.best_return:.2f} (Episode {system.best_episode})")
+    final_weights = system.weights
     print(f"最终权重: [{final_weights[0]:.3f}, {final_weights[1]:.3f}, {final_weights[2]:.3f}]")
-    if explore_rates:
-        print(f"平均探索率: {np.mean(explore_rates):.3f}")
     print("=" * 60)
-
-    # 保存统计报告到文本文件
-    report_path = save_path.replace('.png', '_report.txt')
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write("=" * 60 + "\n")
-        f.write("V4.3 训练统计报告\n")
-        f.write("=" * 60 + "\n")
-        f.write(f"总 Episodes: {len(returns)}\n")
-        f.write(f"平均奖励: {np.mean(returns):.2f} ± {np.std(returns):.2f}\n")
-        f.write(f"最佳奖励: {system.best_return:.2f} (Episode {system.best_episode})\n")
-        f.write(f"最终权重: [{final_weights[0]:.3f}, {final_weights[1]:.3f}, {final_weights[2]:.3f}]\n")
-        if explore_rates:
-            f.write(f"平均探索率: {np.mean(explore_rates):.3f}\n")
-        f.write("=" * 60 + "\n")
-    print(f"📄 统计报告已保存: {report_path}")
-
 
 
 # ============================================
@@ -1163,37 +1451,24 @@ def analyze_and_save_results(system: AdaptiveCuriositySystemV43, save_path: str 
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("🌙 V4.3 中等难度训练 - 建立信心")
+    print("🌙 V5.0 情感好奇心训练")
     print("=" * 60)
-    print("预期目标: 150-180 分")
-    print("训练时间: 约 6-8 小时 (3000 episodes)")
+    print("这是一个有情感的智能体！")
+    print("  - 会对喜欢的区域形成依恋")
+    print("  - 连续失败时会感到沮丧")
+    print("  - 成功时会增强信心")
+    print("  - 情绪影响探索和决策")
     print("=" * 60)
 
-    # 检查是否有之前的检查点
-    checkpoint_path = "checkpoints_v43/champion_model_v43.pth"
-    if os.path.exists(checkpoint_path):
-        print(f"\n发现已有检查点: {checkpoint_path}")
-        choice = input("是否从检查点继续？(y/n): ").strip().lower()
-        resume = checkpoint_path if choice == 'y' else None
-    else:
-        resume = None
-
-    if resume:
-        print("从检查点继续训练...")
-    else:
-        print("从头开始训练...")
-
-    system = train_v43(
+    # 运行训练
+    system = train_v5(
         num_episodes=3000,
         render=True,
         save_freq=100,
         verbose_freq=20
     )
 
-    # ========== 新增：分析并保存结果 ==========
-    print("\n" + "=" * 60)
-    print("生成分析报告...")
-    print("=" * 60)
-    analyze_and_save_results(system, save_path="v43_analysis.png")
+    # 分析结果
+    analyze_and_save_results(system, save_path="v5_analysis.png")
 
-    print("\n✨ V4.3 训练完成！模型信心建立！✨")
+    print("\n✨ V5.0 训练完成！模型拥有了情感！✨")
